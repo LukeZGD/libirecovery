@@ -2324,11 +2324,16 @@ irecv_error_t irecv_usb_set_configuration(irecv_client_t client, int configurati
 
 #ifdef HAVE_IOKIT
 	IOReturn result;
+	UInt8 current = 0;
 
-	result = (*client->handle)->SetConfiguration(client->handle, configuration);
-	if (result != kIOReturnSuccess) {
-		debug("error setting configuration: %#x\n", result);
-		return IRECV_E_USB_CONFIGURATION;
+	/* Re-selecting the active configuration tears down its interfaces. */
+	result = (*client->handle)->GetConfiguration(client->handle, &current);
+	if (result != kIOReturnSuccess || current != configuration) {
+		result = (*client->handle)->SetConfiguration(client->handle, configuration);
+		if (result != kIOReturnSuccess) {
+			debug("error setting configuration: %#x\n", result);
+			return IRECV_E_USB_CONFIGURATION;
+		}
 	}
 #else
 	int current = 0;

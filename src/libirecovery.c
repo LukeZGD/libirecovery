@@ -4218,6 +4218,10 @@ irecv_error_t irecv_send_buffer(irecv_client_t client, unsigned char* buffer, un
 		}
 
 		irecv_reset(client);
+
+		if (isiOS2) {
+			irecv_reconnect(client, 0);
+		}
 	}
 
 	if (legacy_recovery_mode) {

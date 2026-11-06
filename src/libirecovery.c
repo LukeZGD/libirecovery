@@ -1814,6 +1814,8 @@ static int iokit_usb_interrupt_transfer(irecv_client_t client,
 	UInt32 size = length;
 	UInt8 isUSBIn = (endpoint & kUSBbEndpointDirectionMask) != 0;
 	UInt8 numEndpoints;
+	/* IOKit does not support timeouts on interrupt pipes. */
+	(void)timeout;
 
 	if (!intf) return IRECV_E_USB_INTERFACE;
 
@@ -1850,17 +1852,21 @@ static int iokit_usb_interrupt_transfer(irecv_client_t client,
 
 		// Do the transfer
 		if (isUSBIn) {
-			result = (*intf)->ReadPipeTO(intf, pipeRef, data, &size, timeout, timeout);
-			if (result != kIOReturnSuccess)
+			result = (*intf)->ReadPipe(intf, pipeRef, data, &size);
+			if (result != kIOReturnSuccess) {
+				debug("IOKit interrupt read from endpoint 0x%02x failed: %#x\n", endpoint, result);
 				return IRECV_E_PIPE;
+			}
 			*transferred = size;
 
 			return IRECV_E_SUCCESS;
 		}
 		else {
-			result = (*intf)->WritePipeTO(intf, pipeRef, data, size, timeout, timeout);
-			if (result != kIOReturnSuccess)
+			result = (*intf)->WritePipe(intf, pipeRef, data, size);
+			if (result != kIOReturnSuccess) {
+				debug("IOKit interrupt write to endpoint 0x%02x failed: %#x\n", endpoint, result);
 				return IRECV_E_PIPE;
+			}
 			*transferred = size;
 
 			return IRECV_E_SUCCESS;

@@ -1815,6 +1815,8 @@ static int iokit_usb_interrupt_transfer(irecv_client_t client,
 	UInt32 size = length;
 	UInt8 isUSBIn = (endpoint & kUSBbEndpointDirectionMask) != 0;
 	UInt8 numEndpoints;
+	/* IOKit does not support timeouts on interrupt pipes. */
+	(void)timeout;
 
 	if (!intf) return IRECV_E_USB_INTERFACE;
 
@@ -1851,17 +1853,21 @@ static int iokit_usb_interrupt_transfer(irecv_client_t client,
 
 		// Do the transfer
 		if (isUSBIn) {
-			result = (*intf)->ReadPipeTO(intf, pipeRef, data, &size, timeout, timeout);
-			if (result != kIOReturnSuccess)
+			result = (*intf)->ReadPipe(intf, pipeRef, data, &size);
+			if (result != kIOReturnSuccess) {
+				debug("IOKit interrupt read from endpoint 0x%02x failed: %#x\n", endpoint, result);
 				return IRECV_E_PIPE;
+			}
 			*transferred = size;
 
 			return IRECV_E_SUCCESS;
 		}
 		else {
-			result = (*intf)->WritePipeTO(intf, pipeRef, data, size, timeout, timeout);
-			if (result != kIOReturnSuccess)
+			result = (*intf)->WritePipe(intf, pipeRef, data, size);
+			if (result != kIOReturnSuccess) {
+				debug("IOKit interrupt write to endpoint 0x%02x failed: %#x\n", endpoint, result);
 				return IRECV_E_PIPE;
+			}
 			*transferred = size;
 
 			return IRECV_E_SUCCESS;
@@ -2325,11 +2331,16 @@ irecv_error_t irecv_usb_set_configuration(irecv_client_t client, int configurati
 
 #ifdef HAVE_IOKIT
 	IOReturn result;
+	UInt8 current = 0;
 
-	result = (*client->handle)->SetConfiguration(client->handle, configuration);
-	if (result != kIOReturnSuccess) {
-		debug("error setting configuration: %#x\n", result);
-		return IRECV_E_USB_CONFIGURATION;
+	/* Re-selecting the active configuration tears down its interfaces. */
+	result = (*client->handle)->GetConfiguration(client->handle, &current);
+	if (result != kIOReturnSuccess || current != configuration) {
+		result = (*client->handle)->SetConfiguration(client->handle, configuration);
+		if (result != kIOReturnSuccess) {
+			debug("error setting configuration: %#x\n", result);
+			return IRECV_E_USB_CONFIGURATION;
+		}
 	}
 #else
 	int current = 0;
@@ -4066,10 +4077,6 @@ irecv_error_t irecv_send_buffer(irecv_client_t client, unsigned char* buffer, un
 		}
 
 		irecv_reset(client);
-
-		if (isiOS2) {
-			irecv_reconnect(client, 0);
-		}
 	}
 
 	if (legacy_recovery_mode) {

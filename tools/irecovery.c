@@ -32,6 +32,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <errno.h>
 #include <libirecovery.h>
 #ifdef HAVE_READLINE
 #include <readline/readline.h>
@@ -57,6 +58,7 @@ enum {
 	kStartShell,
 	kSendCommand,
 	kSendFile,
+	kGetFile,
 	kSendExploit,
 	kSendScript,
 	kShowMode,
@@ -153,7 +155,7 @@ static void print_device_info(irecv_client_t client)
 		printf("CPID: 0x%04x\n", devinfo->cpid);
 		printf("CPRV: 0x%02x\n", devinfo->cprv);
 		printf("BDID: 0x%02x\n", devinfo->bdid);
-		printf("ECID: 0x%016" PRIx64 "\n", devinfo->ecid);
+		printf("ECID: 0x%016" PRIx64 " (%" PRIu64 ")\n", devinfo->ecid, devinfo->ecid);
 		printf("CPFM: 0x%02x\n", devinfo->cpfm);
 		printf("SCEP: 0x%02x\n", devinfo->scep);
 		printf("IBFL: 0x%02x\n", devinfo->ibfl);
@@ -375,6 +377,113 @@ int received_cb(irecv_client_t client, const irecv_event_t* event)
 	return 0;
 }
 
+static int get_file(irecv_client_t client, const char* filename)
+{
+	int mode = 0;
+	if (irecv_get_mode(client, &mode) != IRECV_E_SUCCESS ||
+		(mode != IRECV_K_RECOVERY_MODE_1 && mode != IRECV_K_RECOVERY_MODE_2 &&
+		 mode != IRECV_K_RECOVERY_MODE_3 && mode != IRECV_K_RECOVERY_MODE_4)) {
+		fprintf(stderr, "ERROR: Getting data requires recovery mode and a payload supporting 'go g'.\n");
+		return -1;
+	}
+
+	FILE* file = fopen(filename, "wb");
+	if (!file) {
+		fprintf(stderr, "ERROR: Could not open '%s': %s\n", filename, strerror(errno));
+		return -1;
+	}
+
+	int result = -1;
+	irecv_error_t error = irecv_event_subscribe(client, IRECV_RECEIVED, &received_cb, NULL);
+	if (error != IRECV_E_SUCCESS) {
+		fprintf(stderr, "ERROR: Could not subscribe to console output: %s\n", irecv_strerror(error));
+		goto close_file;
+	}
+
+	error = irecv_receive(client);
+	if (error == IRECV_E_SUCCESS) {
+		error = irecv_usb_set_interface(client, 1, 1);
+	}
+	if (error != IRECV_E_SUCCESS) {
+		fprintf(stderr, "ERROR: Could not prepare data transfer: %s\n", irecv_strerror(error));
+		goto unsubscribe;
+	}
+
+	while (1) {
+		unsigned char command[] = "go g";
+		int bytes = irecv_usb_control_transfer(client, 0x40, 0, 0, 0, command, sizeof(command), 1000);
+		if (bytes != (int)sizeof(command)) {
+			fprintf(stderr, "ERROR: Could not send 'go g' (USB result %d).\n", bytes);
+			break;
+		}
+
+		unsigned char response[2049];
+		bytes = irecv_usb_control_transfer(client, 0xC0, 0, 0, 0, response, sizeof(response)-1, 1000);
+		if (bytes <= 0) {
+			fprintf(stderr, "ERROR: Could not receive data (USB result %d).\n", bytes);
+			break;
+		}
+		response[bytes] = '\0';
+		if (bytes >= 19 && !memcmp(response, "end-of-transmission", 19)) {
+			error = irecv_receive(client);
+			if (error != IRECV_E_SUCCESS) {
+				fprintf(stderr, "ERROR: Could not receive final console output: %s\n", irecv_strerror(error));
+			} else {
+				result = 0;
+			}
+			break;
+		}
+
+		/* The payload replies with decimal length:hex address:hex data. */
+		unsigned char data[1024];
+		char* start = (char*)response;
+		char* end = NULL;
+		errno = 0;
+		unsigned long length = strtoul(start, &end, 10);
+		if (!isdigit((unsigned char)*start) || errno || *end != ':' || !length || length > sizeof(data)) {
+			fprintf(stderr, "ERROR: Invalid data length in payload reply.\n");
+			break;
+		}
+		start = end + 1;
+		errno = 0;
+		unsigned long address = strtoul(start, &end, 16);
+		if (!isxdigit((unsigned char)*start) || errno || address > UINT32_MAX || *end != ':' ||
+			length > (size_t)((char*)response + bytes - (end + 1)) / 2) {
+			fprintf(stderr, "ERROR: Invalid or truncated data in payload reply.\n");
+			break;
+		}
+
+		start = end + 1;
+		unsigned long i;
+		for (i = 0; i < length; i++) {
+			const char* digits = "0123456789abcdef";
+			const char* high = strchr(digits, tolower((unsigned char)start[2*i]));
+			const char* low = strchr(digits, tolower((unsigned char)start[2*i+1]));
+			if (!isxdigit((unsigned char)start[2*i]) || !isxdigit((unsigned char)start[2*i+1])) {
+				break;
+			}
+			data[i] = ((high - digits) << 4) | (low - digits);
+		}
+		if (i != length) {
+			fprintf(stderr, "ERROR: Invalid hexadecimal data in payload reply.\n");
+			break;
+		}
+		if (fwrite(data, 1, length, file) != length) {
+			fprintf(stderr, "ERROR: Could not write '%s': %s\n", filename, strerror(errno));
+			break;
+		}
+	}
+
+unsubscribe:
+	irecv_event_unsubscribe(client, IRECV_RECEIVED);
+close_file:
+	if (fclose(file) != 0) {
+		fprintf(stderr, "ERROR: Could not close '%s': %s\n", filename, strerror(errno));
+		result = -1;
+	}
+	return result;
+}
+
 int precommand_cb(irecv_client_t client, const irecv_event_t* event)
 {
 	if (event->type == IRECV_PRECOMMAND) {
@@ -473,6 +582,7 @@ static void print_usage(int argc, char **argv)
 	printf("  -c, --command CMD\trun CMD on device\n");
 	printf("  -m, --mode\t\tprint current device mode\n");
 	printf("  -f, --file FILE\tsend file to device\n");
+	printf("  -g, --get FILE\t\tget data into FILE\n");
 	printf("  -k, --payload FILE\tsend limera1n usb exploit payload from FILE\n");
 	printf("  -r, --reset\t\treset client\n");
 	printf("  -n, --normal\t\treboot device into normal mode (exit recovery loop)\n");
@@ -495,6 +605,7 @@ int main(int argc, char* argv[])
 		{ "command", required_argument, NULL, 'c' },
 		{ "mode",    no_argument,       NULL, 'm' },
 		{ "file",    required_argument, NULL, 'f' },
+		{ "get",     required_argument, NULL, 'g' },
 		{ "payload", required_argument, NULL, 'k' },
 		{ "reset",   no_argument,       NULL, 'r' },
 		{ "normal",  no_argument,       NULL, 'n' },
@@ -510,6 +621,7 @@ int main(int argc, char* argv[])
 	int i = 0;
 	int opt = 0;
 	int action = kNoAction;
+	int result = 0;
 	uint64_t ecid = 0;
 	int mode = -1;
 	char* argument = NULL;
@@ -523,7 +635,7 @@ int main(int argc, char* argv[])
 		return 0;
 	}
 
-	while ((opt = getopt_long(argc, argv, "i:vVhrsmnc:f:e:k:qa", longopts, NULL)) > 0) {
+	while ((opt = getopt_long(argc, argv, "i:vVhrsmnc:f:g:e:k:qa", longopts, NULL)) > 0) {
 		switch (opt) {
 			case 'i':
 				if (optarg) {
@@ -565,6 +677,11 @@ int main(int argc, char* argv[])
 
 			case 'f':
 				action = kSendFile;
+				argument = optarg;
+				break;
+
+			case 'g':
+				action = kGetFile;
 				argument = optarg;
 				break;
 
@@ -651,6 +768,10 @@ int main(int argc, char* argv[])
 			irecv_event_subscribe(client, IRECV_PROGRESS, &progress_cb, NULL);
 			error = irecv_send_file(client, argument, IRECV_SEND_OPT_DFU_NOTIFY_FINISH);
 			debug("%s\n", irecv_strerror(error));
+			break;
+
+		case kGetFile:
+			result = get_file(client, argument);
 			break;
 
 		case kSendCommand:
@@ -756,5 +877,5 @@ int main(int argc, char* argv[])
 
 	irecv_close(client);
 
-	return 0;
+	return result;
 }
